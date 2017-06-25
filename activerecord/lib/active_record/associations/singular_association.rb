@@ -36,7 +36,8 @@ module ActiveRecord
         end
 
         def find_target
-          return scope.take if skip_statement_cache?
+          scope = self.scope
+          return scope.take if skip_statement_cache?(scope)
 
           conn = klass.connection
           sc = reflection.association_scope_cache(conn, owner) do
@@ -63,6 +64,10 @@ module ActiveRecord
         end
 
         def _create_record(attributes, raise_error = false)
+          unless owner.persisted?
+            raise ActiveRecord::RecordNotSaved, "You cannot call create unless the parent is saved"
+          end
+
           record = build_record(attributes)
           yield(record) if block_given?
           saved = record.save

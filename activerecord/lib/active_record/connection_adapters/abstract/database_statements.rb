@@ -296,6 +296,9 @@ module ActiveRecord
 
       # Inserts the given fixture into the table. Overridden in adapters that require
       # something beyond a simple insert (eg. Oracle).
+      # Most of adapters should implement `insert_fixtures` that leverages bulk SQL insert.
+      # We keep this method to provide fallback
+      # for databases like sqlite that do not support bulk inserts.
       def insert_fixture(fixture, table_name)
         fixture = fixture.stringify_keys
 
@@ -308,16 +311,52 @@ module ActiveRecord
             raise Fixture::FixtureError, %(table "#{table_name}" has no column named #{name.inspect}.)
           end
         end
-        key_list = fixture.keys.map { |name| quote_column_name(name) }
-        value_list = binds.map(&:value_for_database).map do |value|
-          begin
-            quote(value)
-          rescue TypeError
-            quote(YAML.dump(value))
+
+        table = Arel::Table.new(table_name)
+
+        values = binds.map do |bind|
+          value = with_yaml_fallback(bind.value_for_database)
+          [table[bind.name], value]
+        end
+
+        manager = Arel::InsertManager.new
+        manager.into(table)
+        manager.insert(values)
+        execute manager.to_sql, "Fixture Insert"
+      end
+
+      # Inserts a set of fixtures into the table. Overridden in adapters that require
+      # something beyond a simple insert (eg. Oracle).
+      def insert_fixtures(fixtures, table_name)
+        return if fixtures.empty?
+
+        columns = schema_cache.columns_hash(table_name)
+
+        values = fixtures.map do |fixture|
+          fixture = fixture.stringify_keys
+
+          unknown_columns = fixture.keys - columns.keys
+          if unknown_columns.any?
+            raise Fixture::FixtureError, %(table "#{table_name}" has no columns named #{unknown_columns.map(&:inspect).join(', ')}.)
+          end
+
+          columns.map do |name, column|
+            if fixture.key?(name)
+              type = lookup_cast_type_from_column(column)
+              bind = Relation::QueryAttribute.new(name, fixture[name], type)
+              with_yaml_fallback(bind.value_for_database)
+            else
+              Arel.sql("DEFAULT")
+            end
           end
         end
 
-        execute "INSERT INTO #{quote_table_name(table_name)} (#{key_list.join(', ')}) VALUES (#{value_list.join(', ')})", "Fixture Insert"
+        table = Arel::Table.new(table_name)
+        manager = Arel::InsertManager.new
+        manager.into(table)
+        columns.each_key { |column| manager.columns << table[column] }
+        manager.values = manager.create_values_list(values)
+        execute manager.to_sql, "Fixtures Insert"
       end
 
       def empty_insert_statement_value
@@ -380,6 +419,17 @@ module ActiveRecord
             relation, binds = relation.arel, relation.bound_attributes
           end
           [relation, binds]
+        end
+
+        # Fixture value is quoted by Arel, however scalar values
+        # are not quotable. In this case we want to convert
+        # the column value to YAML.
+        def with_yaml_fallback(value)
+          if value.is_a?(Hash) || value.is_a?(Array)
+            YAML.dump(value)
+          else
+            value
+          end
         end
     end
   end
